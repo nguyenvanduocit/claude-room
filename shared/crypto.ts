@@ -53,12 +53,18 @@ export function decrypt(encoded: string, keyHex: string): string {
 // Parse invite code "room_id:secret_key" into parts
 export function parseInviteCode(code: string): { roomId: string; secretKey: string } {
   const colonIndex = code.indexOf(":");
-  if (colonIndex === -1) {
-    // No secret key — unencrypted mode (backward compat)
-    return { roomId: code, secretKey: "" };
+  if (colonIndex === -1 || code.substring(colonIndex + 1).length === 0) {
+    throw new Error("Invalid invite code — must include secret key (format: room_id:secret_key)");
   }
   return {
     roomId: code.substring(0, colonIndex),
     secretKey: code.substring(colonIndex + 1),
   };
+}
+
+// SHA-256 hash of the secret key (hex string → hex hash)
+export async function hashKey(keyHex: string): Promise<string> {
+  const data = new TextEncoder().encode(keyHex);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return bytesToHex(new Uint8Array(hash));
 }

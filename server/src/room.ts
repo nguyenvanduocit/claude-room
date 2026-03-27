@@ -1,6 +1,7 @@
 import type { PeerInfo, HistoryMessage, ClientMessage, ServerMessage } from "./types";
 
 const MAX_HISTORY = 50;
+const VALIDATION_TIMEOUT_MS = 10_000; // 10 seconds to validate a pending peer
 
 /**
  * Metadata attached to each WebSocket via serializeAttachment/deserializeAttachment.
@@ -9,6 +10,8 @@ const MAX_HISTORY = 50;
 interface WsAttachment {
   peerId: string;
   info: PeerInfo;
+  status: "active" | "pending";
+  keyHash?: string; // only set during pending validation
 }
 
 export class Room implements DurableObject {
@@ -19,16 +22,23 @@ export class Room implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // POST /init — set room name (called once on creation)
+    // POST /init — set room name (called once on creation, marks room as initialized)
     if (request.method === "POST" && url.pathname === "/init") {
       const body = (await request.json()) as { name: string };
       this.roomName = body.name;
       await this.state.storage.put("roomName", body.name);
+      await this.state.storage.put("initialized", true);
       return Response.json({ ok: true });
     }
 
     // GET /ws — WebSocket upgrade
     if (url.pathname === "/ws") {
+      // Only allow joining initialized rooms
+      const initialized = await this.state.storage.get<boolean>("initialized");
+      if (!initialized) {
+        return Response.json({ error: "Room does not exist" }, { status: 404 });
+      }
+
       const upgradeHeader = request.headers.get("Upgrade");
       if (upgradeHeader !== "websocket") {
         return new Response("Expected WebSocket", { status: 426 });
@@ -37,7 +47,6 @@ export class Room implements DurableObject {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
 
-      // Accept with hibernation API — no tag yet, will be set on register
       this.state.acceptWebSocket(server);
 
       return new Response(null, { status: 101, webSocket: client });
@@ -86,6 +95,12 @@ export class Room implements DurableObject {
         case "set_summary":
           this.handleSetSummary(ws, msg);
           break;
+        case "accept_peer":
+          this.handleAcceptPeer(ws, msg);
+          break;
+        case "reject_peer":
+          this.handleRejectPeer(ws, msg);
+          break;
         default:
           this.sendTo(ws, { type: "error", message: "Unknown message type" });
       }
@@ -105,13 +120,13 @@ export class Room implements DurableObject {
 
   // --- Helpers: hibernation-safe peer access ---
 
-  /** Get all registered peers from live WebSockets (survives hibernation). */
+  /** Get all registered (active, non-pending) peers from live WebSockets. */
   private getActivePeers(): { ws: WebSocket; attachment: WsAttachment }[] {
     const sockets = this.state.getWebSockets();
     const result: { ws: WebSocket; attachment: WsAttachment }[] = [];
     for (const s of sockets) {
       const att = s.deserializeAttachment() as WsAttachment | null;
-      if (att?.peerId) {
+      if (att?.peerId && att.status === "active") {
         result.push({ ws: s, attachment: att });
       }
     }
@@ -120,22 +135,40 @@ export class Room implements DurableObject {
 
   private findPeerByWs(ws: WebSocket): WsAttachment | null {
     const att = ws.deserializeAttachment() as WsAttachment | null;
-    return att?.peerId ? att : null;
+    return att?.peerId && att.status === "active" ? att : null;
+  }
+
+  /** Find a pending peer's WebSocket by peer ID. */
+  private findPendingWs(pendingPeerId: string): { ws: WebSocket; attachment: WsAttachment } | null {
+    const sockets = this.state.getWebSockets();
+    for (const s of sockets) {
+      const att = s.deserializeAttachment() as WsAttachment | null;
+      if (att?.peerId === pendingPeerId && att.status === "pending") {
+        return { ws: s, attachment: att };
+      }
+    }
+    return null;
   }
 
   // --- Handlers ---
 
   private async handleRegister(
     ws: WebSocket,
-    msg: { type: "register"; display_name: string; summary: string; project_hint: string }
+    msg: { type: "register"; display_name: string; summary: string; project_hint: string; key_hash: string }
   ): Promise<void> {
-    // Validate display_name is provided and non-empty
+    // Validate display_name
     if (!msg.display_name || msg.display_name.trim().length === 0) {
       this.sendTo(ws, { type: "error", message: "display_name is required" });
       return;
     }
 
-    // Check if this WebSocket is already registered
+    // Validate key_hash
+    if (!msg.key_hash || msg.key_hash.length === 0) {
+      this.sendTo(ws, { type: "error", message: "key_hash is required — unencrypted rooms are not supported" });
+      return;
+    }
+
+    // Check if already registered
     const existing = ws.deserializeAttachment() as WsAttachment | null;
     if (existing?.peerId) {
       this.sendTo(ws, { type: "error", message: "Already registered" });
@@ -153,29 +186,103 @@ export class Room implements DurableObject {
       connected_at: now,
     };
 
-    // Attach metadata to the WebSocket (survives hibernation)
-    const attachment: WsAttachment = { peerId, info };
-    ws.serializeAttachment(attachment);
+    const activePeers = this.getActivePeers();
 
-    // Get current peers (excluding the new one)
+    if (activePeers.length === 0) {
+      // First peer — auto-accept (room creator)
+      const attachment: WsAttachment = { peerId, info, status: "active" };
+      ws.serializeAttachment(attachment);
+
+      this.sendTo(ws, {
+        type: "registered",
+        peer_id: peerId,
+        peers: [],
+      });
+    } else {
+      // Not the first peer — put in pending state and ask existing peers to validate
+      const attachment: WsAttachment = { peerId, info, status: "pending", keyHash: msg.key_hash };
+      ws.serializeAttachment(attachment);
+
+      // Send validate_peer to all active peers
+      this.broadcast({
+        type: "validate_peer",
+        pending_peer_id: peerId,
+        display_name: msg.display_name,
+        key_hash: msg.key_hash,
+      });
+
+      // Set a timeout — if not validated in time, reject
+      setTimeout(() => {
+        const stillPending = this.findPendingWs(peerId);
+        if (!stillPending) return;
+
+        this.sendTo(stillPending.ws, { type: "peer_rejected", reason: "Validation timed out — no peer accepted your key" });
+        try {
+          stillPending.ws.close(4001, "Validation timeout");
+        } catch {
+          // already closed
+        }
+      }, VALIDATION_TIMEOUT_MS);
+    }
+  }
+
+  private handleAcceptPeer(
+    ws: WebSocket,
+    msg: { type: "accept_peer"; pending_peer_id: string }
+  ): void {
+    // Only active peers can accept
+    const acceptor = this.findPeerByWs(ws);
+    if (!acceptor) {
+      this.sendTo(ws, { type: "error", message: "Not registered" });
+      return;
+    }
+
+    const pending = this.findPendingWs(msg.pending_peer_id);
+    if (!pending) return; // already accepted or gone
+
+    // Promote to active
+    pending.attachment.status = "active";
+    delete pending.attachment.keyHash;
+    pending.ws.serializeAttachment(pending.attachment);
+
+    // Get current active peers (excluding the newly promoted one)
     const activePeers = this.getActivePeers();
     const otherPeerInfos = activePeers
-      .filter((p) => p.attachment.peerId !== peerId)
+      .filter((p) => p.attachment.peerId !== pending.attachment.peerId)
       .map((p) => p.attachment.info);
 
-    // Load history from storage
-    const history = (await this.state.storage.get<HistoryMessage[]>("history")) ?? [];
-
-    // Send registration confirmation
-    this.sendTo(ws, {
+    // Send registration confirmation to the accepted peer
+    this.sendTo(pending.ws, {
       type: "registered",
-      peer_id: peerId,
+      peer_id: pending.attachment.peerId,
       peers: otherPeerInfos,
-      history: [...history],
     });
 
     // Notify others that a new peer joined
-    this.broadcast({ type: "peer_joined", peer: info }, peerId);
+    this.broadcast({ type: "peer_joined", peer: pending.attachment.info }, pending.attachment.peerId);
+  }
+
+  private handleRejectPeer(
+    ws: WebSocket,
+    msg: { type: "reject_peer"; pending_peer_id: string }
+  ): void {
+    // Only active peers can reject
+    const rejector = this.findPeerByWs(ws);
+    if (!rejector) {
+      this.sendTo(ws, { type: "error", message: "Not registered" });
+      return;
+    }
+
+    const pending = this.findPendingWs(msg.pending_peer_id);
+    if (!pending) return; // already accepted or gone
+
+    // Immediate rejection — close the pending peer
+    this.sendTo(pending.ws, { type: "peer_rejected", reason: "Key validation failed — your secret key does not match" });
+    try {
+      pending.ws.close(4002, "Key rejected");
+    } catch {
+      // already closed
+    }
   }
 
   private async handleMessage(
@@ -199,7 +306,7 @@ export class Room implements DurableObject {
       to_id: msg.to_id,
     };
 
-    // Persist to history in storage
+    // Persist to history
     const history = (await this.state.storage.get<HistoryMessage[]>("history")) ?? [];
     history.push({
       from_id: sender.info.id,
@@ -214,7 +321,7 @@ export class Room implements DurableObject {
     await this.state.storage.put("history", history);
 
     if (msg.to_id) {
-      // Direct message — send to target and echo back to sender
+      // Direct message
       const activePeers = this.getActivePeers();
       const target = activePeers.find((p) => p.attachment.peerId === msg.to_id);
       if (target) {
@@ -223,10 +330,9 @@ export class Room implements DurableObject {
         this.sendTo(ws, { type: "error", message: `Peer ${msg.to_id} not found` });
         return;
       }
-      // Echo to sender so they see it in history
       this.sendTo(ws, outgoing);
     } else {
-      // Broadcast — send to everyone including sender
+      // Broadcast
       this.broadcast(outgoing);
     }
   }
@@ -236,7 +342,7 @@ export class Room implements DurableObject {
     msg: { type: "set_summary"; summary: string }
   ): void {
     const att = ws.deserializeAttachment() as WsAttachment | null;
-    if (!att?.peerId) {
+    if (!att?.peerId || att.status !== "active") {
       this.sendTo(ws, { type: "error", message: "Not registered" });
       return;
     }
@@ -251,14 +357,17 @@ export class Room implements DurableObject {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     if (!att?.peerId) return;
 
-    this.broadcast(
-      {
-        type: "peer_left",
-        peer_id: att.info.id,
-        display_name: att.info.display_name,
-      },
-      att.peerId
-    );
+    // Only broadcast peer_left for active peers
+    if (att.status === "active") {
+      this.broadcast(
+        {
+          type: "peer_left",
+          peer_id: att.info.id,
+          display_name: att.info.display_name,
+        },
+        att.peerId
+      );
+    }
 
     try {
       ws.close(1000, "Peer left");
@@ -275,7 +384,7 @@ export class Room implements DurableObject {
       try {
         ws.send(data);
       } catch {
-        // Dead connection, will be cleaned up on close event
+        // Dead connection
       }
     }
   }

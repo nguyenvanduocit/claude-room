@@ -30,7 +30,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
-import { encrypt, decrypt, generateSecretKey, parseInviteCode } from "./shared/crypto.ts";
+import { encrypt, decrypt, generateSecretKey, parseInviteCode, hashKey } from "./shared/crypto.ts";
 
 // --- Configuration ---
 
@@ -99,15 +99,17 @@ function connectToRoom(targetRoomId: string) {
 
   const socket = new WebSocket(wsUrl);
 
-  socket.onopen = () => {
+  socket.onopen = async () => {
     log(`WebSocket connected to room ${targetRoomId}`);
     reconnectDelay = 1000; // reset backoff on successful connect
 
+    const keyHash = await hashKey(secretKey);
     const registerMsg: CloudClientMessage = {
       type: "register",
       display_name: myDisplayName,
       summary: currentSummary,
       project_hint: myGitRoot ?? myCwd,
+      key_hash: keyHash,
     };
     socket.send(JSON.stringify(registerMsg));
 
@@ -215,6 +217,32 @@ function handleServerMessage(msg: CloudServerMessage) {
     case "peer_left": {
       connectedPeers.delete(msg.peer_id);
       log(`Peer left: ${msg.display_name} (${msg.peer_id})`);
+      break;
+    }
+
+    case "validate_peer": {
+      // Another peer is trying to join — validate their key_hash against ours
+      hashKey(secretKey).then((ourHash) => {
+        const accepted = ourHash === msg.key_hash;
+        const response: CloudClientMessage = accepted
+          ? { type: "accept_peer", pending_peer_id: msg.pending_peer_id }
+          : { type: "reject_peer", pending_peer_id: msg.pending_peer_id };
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(response));
+        }
+        log(`Peer validation for ${msg.display_name} (${msg.pending_peer_id}): ${accepted ? "ACCEPTED" : "REJECTED"}`);
+      });
+      break;
+    }
+
+    case "peer_rejected": {
+      log(`Join rejected: ${msg.reason}`);
+      // Clear room state since we were rejected
+      roomId = null;
+      myId = null;
+      secretKey = "";
+      connectedPeers.clear();
       break;
     }
 
@@ -411,23 +439,37 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "join_room": {
       const { invite_code, display_name } = args as { invite_code: string; display_name: string };
       myDisplayName = display_name;
-      const parsed = parseInviteCode(invite_code);
+      let parsed: { roomId: string; secretKey: string };
+      try {
+        parsed = parseInviteCode(invite_code);
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: e instanceof Error ? e.message : String(e) }],
+          isError: true,
+        };
+      }
       secretKey = parsed.secretKey;
       const targetRoom = parsed.roomId;
       try {
         connectToRoom(targetRoom);
 
-        // Wait briefly for registration to complete
-        await new Promise((r) => setTimeout(r, 1000));
+        // Wait for registration (may need peer validation, so wait longer)
+        await new Promise((r) => setTimeout(r, 3000));
 
-        const encStatus = secretKey ? " (E2E encrypted)" : " (unencrypted)";
         if (myId) {
           return {
-            content: [{ type: "text" as const, text: `Joined room ${targetRoom} as peer ${myId}${encStatus}` }],
+            content: [{ type: "text" as const, text: `Joined room ${targetRoom} as peer ${myId} (E2E encrypted)` }],
+          };
+        }
+        if (!roomId) {
+          // We were rejected
+          return {
+            content: [{ type: "text" as const, text: `Failed to join room ${targetRoom} — key validation failed or room does not exist` }],
+            isError: true,
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}...${encStatus} (WebSocket may still be establishing)` }],
+          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}... (waiting for peer validation)` }],
         };
       } catch (e) {
         return {
