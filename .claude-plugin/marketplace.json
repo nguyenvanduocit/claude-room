@@ -1,0 +1,17 @@
+{
+  "name": "claude-room",
+  "owner": {
+    "name": "nguyenvanduocit"
+  },
+  "plugins": [
+    {
+      "name": "claude-peers",
+      "source": "./",
+      "description": "Peer discovery and messaging for Claude Code instances — let your sessions find each other and talk",
+      "version": "0.1.0",
+      "author": {
+        "name": "nguyenvanduocit"
+      }
+    }
+  ]
+}

@@ -18,7 +18,8 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ### Option A: Install as plugin (recommended)
 
 ```bash
-claude plugin add -- https://github.com/louislva/claude-peers-mcp.git
+claude plugin marketplace add nguyenvanduocit/claude-room
+claude plugin install claude-peers
 ```
 
 That's it. The MCP server and skills are automatically available in every Claude Code session.
@@ -26,10 +27,10 @@ That's it. The MCP server and skills are automatically available in every Claude
 ### Option B: Manual install
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp
-cd ~/claude-peers-mcp
+git clone https://github.com/nguyenvanduocit/claude-room.git ~/claude-room
+cd ~/claude-room
 bun install
-claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
+claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-room/server.ts
 ```
 
 ### Try it
