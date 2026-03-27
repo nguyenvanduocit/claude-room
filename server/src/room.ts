@@ -3,6 +3,25 @@ import type { PeerInfo, HistoryMessage, ClientMessage, ServerMessage } from "./t
 const MAX_HISTORY = 50;
 const ZOOKEEPER_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
+// --- Input length limits ---
+const MAX_DISPLAY_NAME_LENGTH = 256;
+const MAX_SUMMARY_LENGTH = 1024;
+const MAX_PROJECT_HINT_LENGTH = 512;
+const MAX_MESSAGE_LENGTH = 65536; // 64KB
+
+// --- Timing-safe string comparison ---
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const encoder = new TextEncoder();
+  const bufA = encoder.encode(a);
+  const bufB = encoder.encode(b);
+  let diff = 0;
+  for (let i = 0; i < bufA.length; i++) {
+    diff |= bufA[i] ^ bufB[i];
+  }
+  return diff === 0;
+}
+
 /**
  * Metadata attached to each WebSocket via serializeAttachment/deserializeAttachment.
  * Survives Durable Object hibernation.
@@ -20,22 +39,30 @@ export class Room implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // POST /init — set room name (called once on creation, marks room as initialized)
+    // POST /init — set room name and key_hash (called once on creation)
     if (request.method === "POST" && url.pathname === "/init") {
-      const body = (await request.json()) as { name: string };
+      const body = (await request.json()) as { name: string; key_hash?: string };
       this.roomName = body.name;
       await this.state.storage.put("roomName", body.name);
       await this.state.storage.put("initialized", true);
+      if (body.key_hash) {
+        await this.state.storage.put("keyHash", body.key_hash);
+      }
       return Response.json({ ok: true });
     }
 
-    // GET /ws — WebSocket upgrade
+    // GET /ws — WebSocket upgrade (requires valid key_hash)
     if (url.pathname === "/ws") {
-      // Room must have been created (via /init or first-peer registration)
       const initialized = await this.state.storage.get<boolean>("initialized");
-      const hasKey = await this.state.storage.get<string>("keyHash");
-      if (!initialized && !hasKey) {
+      const storedHash = await this.state.storage.get<string>("keyHash");
+      if (!initialized && !storedHash) {
         return Response.json({ error: "Room does not exist" }, { status: 404 });
+      }
+
+      // Authenticate before upgrading
+      const keyHash = url.searchParams.get("key_hash");
+      if (storedHash && (!keyHash || !timingSafeEqual(keyHash, storedHash))) {
+        return Response.json({ error: "Unauthorized" }, { status: 403 });
       }
 
       const upgradeHeader = request.headers.get("Upgrade");
@@ -50,19 +77,26 @@ export class Room implements DurableObject {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // GET /history?key_hash=... — message history (requires valid key_hash)
-    if (url.pathname === "/history") {
-      const keyHash = new URL(request.url).searchParams.get("key_hash");
+    // POST /history — message history (key_hash in X-Key-Hash header)
+    if (url.pathname === "/history" && request.method === "POST") {
+      const keyHash = request.headers.get("X-Key-Hash");
       const storedHash = await this.state.storage.get<string>("keyHash");
-      if (!keyHash || !storedHash || keyHash !== storedHash) {
+      if (!keyHash || !storedHash || !timingSafeEqual(keyHash, storedHash)) {
         return Response.json({ error: "Unauthorized" }, { status: 403 });
       }
       const history = (await this.state.storage.get<HistoryMessage[]>("history")) ?? [];
       return Response.json({ history });
     }
 
-    // GET /info — room info
+    // GET /info?key_hash=... — room info (requires valid key_hash)
     if (url.pathname === "/info") {
+      const storedHash = await this.state.storage.get<string>("keyHash");
+      if (storedHash) {
+        const keyHash = url.searchParams.get("key_hash");
+        if (!keyHash || !timingSafeEqual(keyHash, storedHash)) {
+          return Response.json({ error: "Unauthorized" }, { status: 403 });
+        }
+      }
       if (!this.roomName) {
         this.roomName = (await this.state.storage.get<string>("roomName")) ?? "";
       }
@@ -156,6 +190,18 @@ export class Room implements DurableObject {
       this.sendTo(ws, { type: "error", message: "display_name is required" });
       return;
     }
+    if (msg.display_name.length > MAX_DISPLAY_NAME_LENGTH) {
+      this.sendTo(ws, { type: "error", message: "display_name too long" });
+      return;
+    }
+    if (msg.summary && msg.summary.length > MAX_SUMMARY_LENGTH) {
+      this.sendTo(ws, { type: "error", message: "summary too long" });
+      return;
+    }
+    if (msg.project_hint && msg.project_hint.length > MAX_PROJECT_HINT_LENGTH) {
+      this.sendTo(ws, { type: "error", message: "project_hint too long" });
+      return;
+    }
 
     if (!msg.key_hash || msg.key_hash.length === 0) {
       this.sendTo(ws, { type: "error", message: "key_hash is required" });
@@ -172,8 +218,9 @@ export class Room implements DurableObject {
 
     if (!storedHash) {
       // First peer (room creator) — store key_hash as canonical
+      // (normally set during /init, but handle legacy rooms)
       await this.state.storage.put("keyHash", msg.key_hash);
-    } else if (msg.key_hash !== storedHash) {
+    } else if (!timingSafeEqual(msg.key_hash, storedHash)) {
       // Key doesn't match — reject
       this.sendTo(ws, { type: "peer_rejected", reason: "Invalid key — your secret key does not match this room" });
       try { ws.close(4002, "Key rejected"); } catch {}
@@ -219,6 +266,10 @@ export class Room implements DurableObject {
     const sender = this.findPeerByWs(ws);
     if (!sender) {
       this.sendTo(ws, { type: "error", message: "Not registered" });
+      return;
+    }
+    if (!msg.text || msg.text.length > MAX_MESSAGE_LENGTH) {
+      this.sendTo(ws, { type: "error", message: `Message must be 1-${MAX_MESSAGE_LENGTH} characters` });
       return;
     }
 
@@ -268,6 +319,10 @@ export class Room implements DurableObject {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     if (!att?.peerId) {
       this.sendTo(ws, { type: "error", message: "Not registered" });
+      return;
+    }
+    if (msg.summary && msg.summary.length > MAX_SUMMARY_LENGTH) {
+      this.sendTo(ws, { type: "error", message: "summary too long" });
       return;
     }
 

@@ -16,19 +16,19 @@ export default {
       return Response.json({ status: "ok" });
     }
 
-    // POST /rooms — create a room
+    // POST /rooms — create a room (accepts optional key_hash to prevent race condition)
     if (request.method === "POST" && url.pathname === "/rooms") {
-      const body = (await request.json()) as { name?: string };
+      const body = (await request.json()) as { name?: string; key_hash?: string };
       const roomName = body.name || "Unnamed Room";
       const roomId = generateRoomId();
 
-      // Create the Durable Object and init it with the room name
+      // Create the Durable Object and init it with the room name + key_hash
       const doId = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(doId);
       await stub.fetch(new Request("http://room/init", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: roomName }),
+        body: JSON.stringify({ name: roomName, key_hash: body.key_hash }),
       }));
 
       const wsUrl = `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}/rooms/${roomId}/ws`;
@@ -36,42 +36,51 @@ export default {
       return Response.json({ room_id: roomId, ws_url: wsUrl, name: roomName });
     }
 
-    // GET /rooms/:room_id/ws — WebSocket upgrade
+    // GET /rooms/:room_id/ws — WebSocket upgrade (forward key_hash for auth)
     const wsMatch = url.pathname.match(/^\/rooms\/([a-z0-9]+)\/ws$/);
     if (wsMatch) {
       const roomId = wsMatch[1];
+      const keyHash = url.searchParams.get("key_hash");
       const doId = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(doId);
 
-      return stub.fetch(new Request("http://room/ws", {
+      const wsUrl = keyHash
+        ? `http://room/ws?key_hash=${encodeURIComponent(keyHash)}`
+        : "http://room/ws";
+      return stub.fetch(new Request(wsUrl, {
         method: "GET",
         headers: request.headers,
       }));
     }
 
-    // GET /rooms/:room_id/history?key_hash=... — message history (requires key_hash)
+    // POST /rooms/:room_id/history — message history (key_hash in X-Key-Hash header)
     const historyMatch = url.pathname.match(/^\/rooms\/([a-z0-9]+)\/history$/);
-    if (historyMatch) {
+    if (historyMatch && request.method === "POST") {
       const roomId = historyMatch[1];
-      const keyHash = url.searchParams.get("key_hash");
+      const keyHash = request.headers.get("X-Key-Hash");
       if (!keyHash) {
-        return Response.json({ error: "key_hash query parameter required" }, { status: 401 });
+        return Response.json({ error: "X-Key-Hash header required" }, { status: 401 });
       }
 
       const doId = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(doId);
-      return stub.fetch(new Request(`http://room/history?key_hash=${encodeURIComponent(keyHash)}`));
+      return stub.fetch(new Request("http://room/history", {
+        method: "POST",
+        headers: { "X-Key-Hash": keyHash },
+      }));
     }
 
-    // GET /rooms/:room_id — room info
+    // GET /rooms/:room_id — room info (requires key_hash)
     const infoMatch = url.pathname.match(/^\/rooms\/([a-z0-9]+)$/);
     if (infoMatch) {
       const roomId = infoMatch[1];
+      const keyHash = url.searchParams.get("key_hash");
       const doId = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(doId);
-      const res = await stub.fetch(new Request("http://room/info"));
-      const data = await res.json();
-      return Response.json(data);
+      const infoUrl = keyHash
+        ? `http://room/info?key_hash=${encodeURIComponent(keyHash)}`
+        : "http://room/info";
+      return stub.fetch(new Request(infoUrl));
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });

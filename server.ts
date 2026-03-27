@@ -80,7 +80,7 @@ let secretKey: string = ""; // E2E encryption key for current room
 
 // --- WebSocket connection manager ---
 
-function connectToRoom(targetRoomId: string) {
+async function connectToRoom(targetRoomId: string) {
   // Close existing connection if any
   if (ws) {
     try { ws.close(); } catch {}
@@ -94,8 +94,11 @@ function connectToRoom(targetRoomId: string) {
   roomId = targetRoomId;
   reconnectDelay = 1000;
 
-  const wsUrl = `${CLOUD_BROKER_URL.replace("https", "wss").replace("http", "ws")}/rooms/${targetRoomId}/ws`;
-  log(`Connecting to room ${targetRoomId} at ${wsUrl}`);
+  const baseWsUrl = `${CLOUD_BROKER_URL.replace("https", "wss").replace("http", "ws")}/rooms/${targetRoomId}/ws`;
+  // Pass key_hash on WebSocket URL for pre-upgrade authentication
+  const keyHashForWs = secretKey ? await hashKey(secretKey) : "";
+  const wsUrl = keyHashForWs ? `${baseWsUrl}?key_hash=${encodeURIComponent(keyHashForWs)}` : baseWsUrl;
+  log(`Connecting to room ${targetRoomId} at ${baseWsUrl}`);
 
   const socket = new WebSocket(wsUrl);
 
@@ -104,11 +107,12 @@ function connectToRoom(targetRoomId: string) {
     reconnectDelay = 1000; // reset backoff on successful connect
 
     const keyHash = await hashKey(secretKey);
+    const projectHint = (myGitRoot ?? myCwd).split("/").pop() ?? "unknown";
     const registerMsg: CloudClientMessage = {
       type: "register",
-      display_name: myDisplayName,
-      summary: currentSummary,
-      project_hint: myGitRoot ?? myCwd,
+      display_name: secretKey ? encrypt(myDisplayName, secretKey) : myDisplayName,
+      summary: secretKey ? encrypt(currentSummary, secretKey) : currentSummary,
+      project_hint: secretKey ? encrypt(projectHint, secretKey) : projectHint,
       key_hash: keyHash,
     };
     socket.send(JSON.stringify(registerMsg));
@@ -142,10 +146,10 @@ function connectToRoom(targetRoomId: string) {
     if (roomId) {
       const delay = Math.min(reconnectDelay, 30000);
       log(`Reconnecting in ${delay}ms...`);
-      reconnectTimer = setTimeout(() => {
+      reconnectTimer = setTimeout(async () => {
         if (roomId) {
           reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-          connectToRoom(roomId);
+          await connectToRoom(roomId);
         }
       }, delay);
     }
@@ -159,13 +163,27 @@ function connectToRoom(targetRoomId: string) {
   ws = socket;
 }
 
+function decryptPeerInfo(peer: CloudPeerInfo): CloudPeerInfo {
+  if (!secretKey) return peer;
+  try {
+    return {
+      ...peer,
+      display_name: decrypt(peer.display_name, secretKey),
+      summary: peer.summary ? decrypt(peer.summary, secretKey) : "",
+      project_hint: peer.project_hint ? decrypt(peer.project_hint, secretKey) : "",
+    };
+  } catch {
+    return peer; // fallback if decryption fails (e.g. legacy unencrypted peer)
+  }
+}
+
 function handleServerMessage(msg: CloudServerMessage) {
   switch (msg.type) {
     case "registered": {
       myId = msg.peer_id;
       connectedPeers.clear();
       for (const peer of msg.peers) {
-        connectedPeers.set(peer.id, peer);
+        connectedPeers.set(peer.id, decryptPeerInfo(peer));
       }
       log(`Registered as peer ${myId} with ${msg.peers.length} peer(s)`);
       break;
@@ -209,8 +227,9 @@ function handleServerMessage(msg: CloudServerMessage) {
     }
 
     case "peer_joined": {
-      connectedPeers.set(msg.peer.id, msg.peer);
-      log(`Peer joined: ${msg.peer.display_name} (${msg.peer.id})`);
+      const decryptedPeer = decryptPeerInfo(msg.peer);
+      connectedPeers.set(msg.peer.id, decryptedPeer);
+      log(`Peer joined: ${decryptedPeer.display_name} (${msg.peer.id})`);
       break;
     }
 
@@ -383,10 +402,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { room_name, display_name } = args as { room_name: string; display_name: string };
       myDisplayName = display_name;
       try {
+        // Generate E2E encryption key before creation to prevent race condition
+        secretKey = generateSecretKey();
+        const creationKeyHash = await hashKey(secretKey);
+
         const res = await fetch(`${CLOUD_BROKER_URL}/rooms`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: room_name }),
+          body: JSON.stringify({ name: room_name, key_hash: creationKeyHash }),
         });
         if (!res.ok) {
           const err = await res.text();
@@ -396,12 +419,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         const data = await res.json() as { room_id: string; ws_url: string; name: string };
-
-        // Generate E2E encryption key
-        secretKey = generateSecretKey();
         const inviteCode = `${data.room_id}:${secretKey}`;
 
-        connectToRoom(data.room_id);
+        await connectToRoom(data.room_id);
 
         // Wait briefly for registration to complete
         await new Promise((r) => setTimeout(r, 1000));
@@ -435,7 +455,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       secretKey = parsed.secretKey;
       const targetRoom = parsed.roomId;
       try {
-        connectToRoom(targetRoom);
+        await connectToRoom(targetRoom);
 
         // Wait briefly for registration
         await new Promise((r) => setTimeout(r, 1000));
@@ -552,7 +572,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       currentSummary = summary;
 
       if (ws && ws.readyState === WebSocket.OPEN) {
-        const msg: CloudClientMessage = { type: "set_summary", summary };
+        const encSummary = secretKey ? encrypt(summary, secretKey) : summary;
+        const msg: CloudClientMessage = { type: "set_summary", summary: encSummary };
         ws.send(JSON.stringify(msg));
       }
 
@@ -571,7 +592,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       try {
         const keyHash = await hashKey(secretKey);
-        const res = await fetch(`${CLOUD_BROKER_URL}/rooms/${roomId}/history?key_hash=${encodeURIComponent(keyHash)}`);
+        const res = await fetch(`${CLOUD_BROKER_URL}/rooms/${roomId}/history`, {
+          method: "POST",
+          headers: { "X-Key-Hash": keyHash },
+        });
         if (!res.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to fetch history: ${res.status}` }],
@@ -652,7 +676,8 @@ async function main() {
 
         // If already connected, push the summary update
         if (ws && ws.readyState === WebSocket.OPEN) {
-          const msg: CloudClientMessage = { type: "set_summary", summary };
+          const encSummary = secretKey ? encrypt(summary, secretKey) : summary;
+          const msg: CloudClientMessage = { type: "set_summary", summary: encSummary };
           ws.send(JSON.stringify(msg));
         }
       }
@@ -673,7 +698,7 @@ async function main() {
     const parsed = parseInviteCode(AUTO_JOIN_ROOM);
     secretKey = parsed.secretKey;
     log(`Auto-joining room: ${parsed.roomId}${parsed.secretKey ? " (E2E encrypted)" : ""}`);
-    connectToRoom(parsed.roomId);
+    await connectToRoom(parsed.roomId);
   }
 
   // 5. Clean up on exit
