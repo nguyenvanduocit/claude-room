@@ -201,6 +201,12 @@ function handleServerMessage(msg: CloudServerMessage) {
       };
       messageHistory.push(historyEntry);
 
+      // Skip channel notification for own messages (broker echoes them back)
+      if (msg.from_id === myId) {
+        log(`Echo (self): ${decryptedText.slice(0, 80)}`);
+        break;
+      }
+
       // Push as channel notification
       const sender = connectedPeers.get(msg.from_id);
       mcp.notification({
