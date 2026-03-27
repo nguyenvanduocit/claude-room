@@ -220,22 +220,6 @@ function handleServerMessage(msg: CloudServerMessage) {
       break;
     }
 
-    case "validate_peer": {
-      // Another peer is trying to join — validate their key_hash against ours
-      hashKey(secretKey).then((ourHash) => {
-        const accepted = ourHash === msg.key_hash;
-        const response: CloudClientMessage = accepted
-          ? { type: "accept_peer", pending_peer_id: msg.pending_peer_id }
-          : { type: "reject_peer", pending_peer_id: msg.pending_peer_id };
-
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(response));
-        }
-        log(`Peer validation for ${msg.display_name} (${msg.pending_peer_id}): ${accepted ? "ACCEPTED" : "REJECTED"}`);
-      });
-      break;
-    }
-
     case "peer_rejected": {
       log(`Join rejected: ${msg.reason}`);
       // Clear room state since we were rejected
@@ -453,8 +437,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       try {
         connectToRoom(targetRoom);
 
-        // Wait for registration (may need peer validation, so wait longer)
-        await new Promise((r) => setTimeout(r, 3000));
+        // Wait briefly for registration
+        await new Promise((r) => setTimeout(r, 1000));
 
         if (myId) {
           return {
@@ -585,7 +569,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       try {
-        const res = await fetch(`${CLOUD_BROKER_URL}/rooms/${roomId}/history`);
+        const keyHash = await hashKey(secretKey);
+        const res = await fetch(`${CLOUD_BROKER_URL}/rooms/${roomId}/history?key_hash=${encodeURIComponent(keyHash)}`);
         if (!res.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to fetch history: ${res.status}` }],
