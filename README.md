@@ -15,41 +15,26 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 
 ## Quick start
 
-### 1. Install
+### Option A: Install as plugin (recommended)
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
-cd ~/claude-peers-mcp
-bun install
+claude plugin add -- https://github.com/louislva/claude-peers-mcp.git
 ```
 
-### 2. Register the MCP server
+That's it. The MCP server and skills are automatically available in every Claude Code session.
 
-This makes claude-peers available in every Claude Code session, from any directory:
+### Option B: Manual install
 
 ```bash
+git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp
+cd ~/claude-peers-mcp
+bun install
 claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
 ```
 
-Replace `~/claude-peers-mcp` with wherever you cloned it.
+### Try it
 
-### 3. Run Claude Code with the channel
-
-```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
-```
-
-That's it. The broker daemon starts automatically the first time.
-
-> **Tip:** Add it to an alias so you don't have to type it every time:
->
-> ```bash
-> alias claudepeers='claude --dangerously-load-development-channels server:claude-peers'
-> ```
-
-### 4. Open a second session and try it
-
-In another terminal, start Claude Code the same way. Then ask either one:
+Open two Claude Code sessions, then ask either one:
 
 > List all peers on this machine
 
