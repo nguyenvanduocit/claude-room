@@ -76,6 +76,7 @@ let connectedPeers: Map<string, CloudPeerInfo> = new Map();
 let messageHistory: CloudHistoryMessage[] = [];
 let reconnectDelay = 1000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let secretKey: string = ""; // E2E encryption key for current room
 
 // --- WebSocket connection manager ---
@@ -85,6 +86,10 @@ function connectToRoom(targetRoomId: string) {
   if (ws) {
     try { ws.close(); } catch {}
     ws = null;
+  }
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 
   roomId = targetRoomId;
@@ -106,6 +111,13 @@ function connectToRoom(targetRoomId: string) {
       project_hint: myGitRoot ?? myCwd,
     };
     socket.send(JSON.stringify(registerMsg));
+
+    // Keep connection alive with periodic pings
+    heartbeatTimer = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.ping();
+      }
+    }, 20000);
   };
 
   socket.onmessage = (event) => {
@@ -120,6 +132,10 @@ function connectToRoom(targetRoomId: string) {
   socket.onclose = () => {
     log("WebSocket closed");
     ws = null;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
 
     // Auto-reconnect with exponential backoff if we still want to be in this room
     if (roomId) {
