@@ -123,6 +123,12 @@ export class Room implements DurableObject {
     ws: WebSocket,
     msg: { type: "register"; display_name: string; summary: string; project_hint: string }
   ): Promise<void> {
+    // Validate display_name is provided and non-empty
+    if (!msg.display_name || msg.display_name.trim().length === 0) {
+      this.sendTo(ws, { type: "error", message: "display_name is required" });
+      return;
+    }
+
     // Check if this WebSocket is already registered
     const existing = ws.deserializeAttachment() as WsAttachment | null;
     if (existing?.peerId) {

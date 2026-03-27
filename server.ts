@@ -223,38 +223,12 @@ function handleServerMessage(msg: CloudServerMessage) {
 
     case "peer_joined": {
       connectedPeers.set(msg.peer.id, msg.peer);
-
-      mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: `Peer joined: ${msg.peer.display_name} (${msg.peer.id}) — ${msg.peer.summary || "no summary"}`,
-          meta: {
-            event: "peer_joined",
-            peer_id: msg.peer.id,
-            peer_name: msg.peer.display_name,
-          },
-        },
-      }).catch((e) => log(`Channel notification error: ${e}`));
-
       log(`Peer joined: ${msg.peer.display_name} (${msg.peer.id})`);
       break;
     }
 
     case "peer_left": {
       connectedPeers.delete(msg.peer_id);
-
-      mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: `Peer left: ${msg.display_name} (${msg.peer_id})`,
-          meta: {
-            event: "peer_left",
-            peer_id: msg.peer_id,
-            peer_name: msg.display_name,
-          },
-        },
-      }).catch((e) => log(`Channel notification error: ${e}`));
-
       log(`Peer left: ${msg.display_name} (${msg.peer_id})`);
       break;
     }
@@ -282,15 +256,15 @@ IMPORTANT: When you receive a <channel source="claude-room" ...> message, RESPON
 Read the from_id, from_name, and from_summary attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- create_room: Create a new room and auto-join it. Returns an invite code with encryption key.
-- join_room: Join an existing room by invite code (room_id:secret_key)
+- create_room: Create a new room and auto-join it. Requires room_name and your display_name. Returns an invite code with encryption key.
+- join_room: Join an existing room by invite code (room_id:secret_key). Requires your display_name.
 - leave_room: Disconnect from the current room
 - list_peers: List other Claude Code instances in the current room
 - send_message: Send a message to a specific peer or broadcast to all
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - get_history: Get message history for the current room
 
-When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
+When you create or join a room, always provide a meaningful display_name so other peers know who you are. After joining, call set_summary to describe what you're working on.`,
   }
 );
 
@@ -304,12 +278,16 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        name: {
+        room_name: {
           type: "string" as const,
           description: "A human-readable name for the room",
         },
+        display_name: {
+          type: "string" as const,
+          description: "Your display name visible to other peers (e.g., your name or role)",
+        },
       },
-      required: ["name"],
+      required: ["room_name", "display_name"],
     },
   },
   {
@@ -323,8 +301,12 @@ const TOOLS = [
           type: "string" as const,
           description: "The invite code to join (format: room_id:secret_key). A plain room_id also works but without encryption.",
         },
+        display_name: {
+          type: "string" as const,
+          description: "Your display name visible to other peers (e.g., your name or role)",
+        },
       },
-      required: ["invite_code"],
+      required: ["invite_code", "display_name"],
     },
   },
   {
@@ -401,12 +383,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "create_room": {
-      const { name: roomName } = args as { name: string };
+      const { room_name, display_name } = args as { room_name: string; display_name: string };
+      myDisplayName = display_name;
       try {
         const res = await fetch(`${CLOUD_BROKER_URL}/rooms`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: roomName }),
+          body: JSON.stringify({ name: room_name }),
         });
         if (!res.ok) {
           const err = await res.text();
@@ -441,7 +424,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "join_room": {
-      const { invite_code } = args as { invite_code: string };
+      const { invite_code, display_name } = args as { invite_code: string; display_name: string };
+      myDisplayName = display_name;
       const parsed = parseInviteCode(invite_code);
       secretKey = parsed.secretKey;
       const targetRoom = parsed.roomId;
