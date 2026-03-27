@@ -269,7 +269,7 @@ function handleServerMessage(msg: CloudServerMessage) {
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-room", version: "0.2.0" },
+  { name: "claude-room", version: "0.3.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

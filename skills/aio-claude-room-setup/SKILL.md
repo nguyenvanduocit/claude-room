@@ -110,5 +110,6 @@ After setup, start Claude Code and check:
 
 ### Self-hosted broker
 - The broker is a Cloudflare Worker + Durable Objects.
-- Source code is at `/Volumes/Data/tmp/claude-room-server/`.
-- Deploy your own and set `CLAUDE_ROOM_URL` to point to it.
+- Source code is in the `server/` directory of this repo.
+- Deploy your own: `cd server && wrangler deploy`
+- Set `CLAUDE_ROOM_URL` to point to your deployed worker.

@@ -1,6 +1,6 @@
 {
   "name": "claude-room",
-  "version": "0.2.0",
-  "description": "Peer discovery and messaging for Claude Code instances — let your sessions find each other and talk",
+  "version": "0.3.0",
+  "description": "Real-time E2E encrypted messaging between Claude Code instances — create rooms, discover peers, and collaborate across machines",
   "mcpServers": "./.mcp.json"
 }
