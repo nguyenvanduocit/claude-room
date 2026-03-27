@@ -12,7 +12,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to cloud broker via WebSocket, exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for cloud broker protocol.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Git context helpers (branch detection).
 - `shared/crypto.ts` — E2E encryption (NaCl secretbox) and invite code parsing.
 - `server/` — Cloud broker (Cloudflare Worker + Durable Objects), deployed at `claude-room.nguyenvanduocit.workers.dev`. Run `cd server && wrangler dev` for local dev, `wrangler deploy` to publish.
 
@@ -22,7 +22,6 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 |----------|---------|-------------|
 | `CLAUDE_ROOM_URL` | `https://claude-room.nguyenvanduocit.workers.dev` | Cloud broker URL |
 | `CLAUDE_ROOM_ID` | — | Auto-join this room on startup |
-| `OPENAI_API_KEY` | — | Enables auto-summary via gpt-5.4-nano |
 
 ## Running
 

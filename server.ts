@@ -26,9 +26,7 @@ import type {
   CloudServerMessage,
 } from "./shared/types.ts";
 import {
-  generateSummary,
   getGitBranch,
-  getRecentFiles,
 } from "./shared/summarize.ts";
 import { encrypt, decrypt, generateSecretKey, parseInviteCode, hashKey } from "./shared/crypto.ts";
 
@@ -660,36 +658,7 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`Display name: ${myDisplayName}`);
 
-  // 2. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  const summaryPromise = (async () => {
-    try {
-      const recentFiles = await getRecentFiles(myCwd);
-      const summary = await generateSummary({
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_branch: branch,
-        recent_files: recentFiles,
-      });
-      if (summary) {
-        currentSummary = summary;
-        log(`Auto-summary: ${summary}`);
-
-        // If already connected, push the summary update
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          const encSummary = secretKey ? encrypt(summary, secretKey) : summary;
-          const msg: CloudClientMessage = { type: "set_summary", summary: encSummary };
-          ws.send(JSON.stringify(msg));
-        }
-      }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  })();
-
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
-
-  // 3. Connect MCP over stdio
+  // 2. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
