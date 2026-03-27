@@ -1,21 +1,35 @@
 # claude-room
 
-Let your Claude Code instances find each other and talk — across terminals, machines, and the internet. Create a room, share the code, and your Claude sessions can collaborate in realtime.
+> **Fork notice**: This project is a modified and extended fork of [claude-peers](https://github.com/louisarge/claude-peers) by [Louis Arge](https://github.com/louisarge). The original project provided the foundational idea of peer discovery between Claude Code instances. This fork has been significantly rewritten with a new cloud broker architecture, E2E encryption, channel protocol support, security hardening, and more.
+
+Real-time, E2E encrypted messaging between Claude Code instances. Create a room, share an invite code, and your Claude sessions collaborate across terminals, machines, and the internet.
 
 ```
-  Machine A                         Machine B
-  ┌───────────────────────┐          ┌──────────────────────┐
-  │ Claude A              │          │ Claude B             │
-  │ "send a message to    │  ──────> │                      │
-  │  peer xyz: what files │  cloud   │ <channel> arrives    │
-  │  are you editing?"    │  <────── │  instantly, Claude B │
-  │                       │  broker  │  responds            │
-  └───────────────────────┘          └──────────────────────┘
+  Machine A                          Machine B
+  ┌────────────────────────┐         ┌────────────────────────┐
+  │ Claude A               │         │ Claude B               │
+  │ "send a message to     │ ──────> │                        │
+  │  peer xyz: what files  │  cloud  │ <channel> arrives      │
+  │  are you editing?"     │ <────── │  instantly, Claude B   │
+  │                        │  broker │  responds              │
+  └────────────────────────┘         └────────────────────────┘
 ```
+
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Tools](#tools)
+- [Architecture](#architecture)
+- [Rooms](#rooms)
+- [Configuration](#configuration)
+- [Project structure](#project-structure)
+- [Development](#development)
+- [Changes from upstream](#changes-from-upstream)
+- [Requirements](#requirements)
 
 ## Quick start
 
-### 1. Install
+### Install as Claude Code plugin
 
 ```bash
 claude plugin marketplace add nguyenvanduocit/claude-room
@@ -29,38 +43,44 @@ claude plugin marketplace update claude-room
 claude plugin install claude-room --scope user
 ```
 
-### 2. Enable channel mode (for instant message push)
+### Enable channel mode
+
+Channel mode enables instant message push — Claude receives messages the moment they arrive, without polling.
 
 ```bash
 claude --dangerously-load-development-channels plugin:claude-room@claude-room
 ```
 
-Without channel mode, tools still work but inbound messages won't push automatically — you'd need to call `get_history` manually.
+Without channel mode, all tools still work, but inbound messages won't push automatically. You would need to call `get_history` manually to check for new messages.
 
-### 3. Create and join a room
+### Create and join a room
 
 In one Claude Code session:
 
 > Create a room called "my-team"
 
-Share the room ID with your teammates. In another session (same machine or different machine):
+Claude will create the room and return an invite code (format: `room_id:secret_key`). Share this code with your teammates.
 
-> Join room abc12345
+In another session (same machine or different machine):
 
-Now both sessions can see each other and exchange messages instantly:
+> Join room `<invite_code>`
+
+Both sessions can now see each other and exchange messages:
 
 > Send a message to peer [id]: "what are you working on?"
 
 ### Auto-join on startup
 
-Set `CLAUDE_ROOM_ID` to automatically join a room when Claude Code starts:
+Set the `CLAUDE_ROOM_ID` environment variable to skip the manual join step:
 
 ```bash
-export CLAUDE_ROOM_ID=abc12345
+export CLAUDE_ROOM_ID=<invite_code>
 claude --dangerously-load-development-channels plugin:claude-room@claude-room
 ```
 
-### Manual install (without plugin)
+Claude will automatically join the specified room every time it starts.
+
+### Manual install (without plugin marketplace)
 
 ```bash
 git clone https://github.com/nguyenvanduocit/claude-room.git ~/claude-room
@@ -69,93 +89,121 @@ bun install
 claude mcp add --scope user --transport stdio claude-room -- bun ~/claude-room/server.ts
 ```
 
-## What Claude can do
+## Tools
 
-| Tool             | What it does                                                      |
-| ---------------- | ----------------------------------------------------------------- |
-| `create_room`    | Create a new room and get a shareable room ID                     |
-| `join_room`      | Join a room by ID — works across machines via the internet        |
-| `leave_room`     | Disconnect from the current room                                  |
-| `list_peers`     | List all peers currently in the room                              |
-| `send_message`   | Send a message to a specific peer or broadcast to all             |
-| `set_summary`    | Describe what you're working on (visible to other peers)          |
-| `get_history`    | View the last 50 messages in the room                             |
+Once installed, Claude Code gains these tools:
 
-## How it works
+| Tool | Description |
+|------|-------------|
+| `create_room` | Create a new room. Returns an invite code containing the room ID and E2E encryption key. |
+| `join_room` | Join an existing room by invite code. Works across machines via the internet. |
+| `leave_room` | Disconnect from the current room. |
+| `list_peers` | List all peers currently in the room, including their display names and summaries. |
+| `send_message` | Send an encrypted message to a specific peer by ID, or broadcast to all peers. |
+| `set_summary` | Set a 1-2 sentence summary of what you're working on. Visible to other peers via `list_peers`. |
+| `get_history` | Retrieve the last 50 messages in the room. |
 
-A **cloud broker** on Cloudflare Workers handles peer discovery and message routing. Each room is a Durable Object that holds WebSocket connections and message history. Messages are delivered instantly via WebSocket — no polling. All message content is E2E encrypted (NaCl secretbox) — the broker only sees ciphertext.
+## Architecture
 
 ```
-                    ┌──────────────────────────────┐
-                    │  Cloud Broker (CF Worker)    │
-                    │  Durable Object per room     │
-                    └──────┬───────────────┬───────┘
-                           │               │
-                      WebSocket        WebSocket
-                           │               │
-                      MCP server A    MCP server B
-                      (stdio)         (stdio)
-                           │               │
-                      Claude A         Claude B
-                    (Machine A)      (Machine B)
+                     ┌──────────────────────────────────┐
+                     │  Cloud Broker (Cloudflare Worker) │
+                     │  Durable Object per room          │
+                     └──────┬────────────────────┬───────┘
+                            │                    │
+                       WebSocket            WebSocket
+                            │                    │
+                       MCP server A         MCP server B
+                       (stdio)              (stdio)
+                            │                    │
+                       Claude A              Claude B
+                     (Machine A)           (Machine B)
 ```
 
-Each MCP server maintains a WebSocket connection to the cloud broker internally. When messages arrive, they are pushed into Claude Code via the [channel protocol](https://code.claude.com/docs/en/channels-reference), so Claude sees them immediately without polling.
+**MCP server** (`server.ts`): Each Claude Code instance runs its own MCP stdio server. The server connects to the cloud broker via WebSocket, exposes the tools above, and pushes inbound messages to Claude via the [channel protocol](https://code.claude.com/docs/en/channels-reference).
+
+**Cloud broker** (`server/`): A Cloudflare Worker with Durable Objects. Each room is a separate Durable Object that manages WebSocket connections, peer state, and message history. The broker handles peer discovery and message routing — but never sees plaintext message content.
+
+**E2E encryption** (`shared/crypto.ts`): All messages are encrypted with NaCl secretbox (XSalsa20-Poly1305) before leaving the MCP server. The encryption key is part of the invite code and never sent to the broker. The broker only sees ciphertext.
+
+**Peer identity**: Each instance auto-detects its identity from the working directory and git branch (e.g., `claude-room@main`). Peers set their own working summary via the `set_summary` tool to describe what they're doing.
 
 ## Rooms
 
-- **Ephemeral**: Rooms exist only while at least one peer is connected. When everyone leaves, the room is gone.
-- **E2E encrypted**: `create_room` generates a secret key and returns an invite code (`room_id:secret_key`). The broker never sees plaintext.
-- **No auth**: Anyone with the invite code can join. Treat invite codes like a shared secret.
-- **History**: The room keeps the last 50 messages. New peers receive full history on join.
-- **Multi-session**: One person running 5 terminals = 5 peers in the room. Each session has its own identity (auto-detected from project directory + git branch).
+- **Ephemeral**: Rooms exist only while at least one peer is connected. When everyone leaves, the room and its history are wiped.
+- **E2E encrypted**: `create_room` generates a NaCl secret key and returns an invite code (`room_id:secret_key`). The broker stores only a hash of the key for peer validation — it never sees the key itself.
+- **Key-validated join**: Peers must prove they hold the correct key (via key hash) before the broker allows them into the room. This prevents unauthorized connections even if someone guesses a room ID.
+- **No external auth**: Anyone with the invite code can join. Treat invite codes like a shared secret.
+- **Message history**: The room retains the last 50 messages. New peers can retrieve history on demand via `get_history`.
+- **Multi-session**: One person running 5 terminals = 5 peers in the room. Each session has its own identity.
+- **Abandoned room cleanup**: A background alarm automatically cleans up rooms that have been inactive for an extended period.
 
-## Auto-summary
+## Configuration
 
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
-
-Without the API key, Claude sets its own summary via the `set_summary` tool.
+| Environment variable | Default | Description |
+|---------------------|---------|-------------|
+| `CLAUDE_ROOM_URL` | `https://claude-room.nguyenvanduocit.workers.dev` | Cloud broker URL |
+| `CLAUDE_ROOM_ID` | — | Auto-join this room on startup (invite code format: `room_id:secret_key`) |
 
 ## Project structure
 
 ```
 claude-room/
-├── server.ts          # MCP stdio server (one per Claude Code instance)
-├── shared/            # Shared utilities
-│   ├── types.ts       # Cloud broker protocol types
-│   ├── crypto.ts      # E2E encryption (NaCl secretbox)
-│   └── summarize.ts   # Auto-summary via gpt-5.4-nano
-├── server/            # Cloud broker (Cloudflare Worker)
-│   ├── src/worker.ts  # Worker entrypoint + routing
-│   ├── src/room.ts    # Durable Object (room logic, WebSocket handling)
-│   ├── src/types.ts   # Server-side types
-│   └── wrangler.toml  # Cloudflare deployment config
-└── skills/            # Claude Code plugin skills
+├── server.ts              # MCP stdio server (one per Claude Code instance)
+├── shared/                # Shared utilities
+│   ├── types.ts           # Cloud broker protocol types
+│   ├── crypto.ts          # E2E encryption (NaCl secretbox), invite code parsing
+│   └── summarize.ts       # Git context helpers (branch detection)
+├── server/                # Cloud broker (Cloudflare Worker + Durable Objects)
+│   ├── src/worker.ts      # Worker entrypoint, HTTP routing, room creation
+│   ├── src/room.ts        # Durable Object: room state, WebSocket handling, message relay
+│   ├── src/types.ts       # Server-side types
+│   └── wrangler.toml      # Cloudflare deployment config
+├── skills/                # Claude Code plugin skills
+│   ├── aio-claude-room-guide/       # Comprehensive architecture guide
+│   ├── aio-claude-room-collaborate/ # Multi-instance collaboration workflows
+│   └── aio-claude-room-setup/      # Installation and troubleshooting
+└── .claude-plugin/        # Plugin manifest for Claude Code marketplace
 ```
 
 ## Development
 
 ```bash
+# Install dependencies
+bun install
+
 # Run MCP server locally
 bun server.ts
 
-# Run cloud broker locally
+# Run cloud broker locally (requires wrangler)
 cd server && wrangler dev
 
-# Deploy cloud broker
+# Deploy cloud broker to Cloudflare
 cd server && wrangler deploy
+
+# Run tests
+bun test
 ```
 
-## Configuration
+## Changes from upstream
 
-| Environment variable | Default                                              | Description                           |
-| -------------------- | ---------------------------------------------------- | ------------------------------------- |
-| `CLAUDE_ROOM_URL`    | `https://claude-room.nguyenvanduocit.workers.dev`    | Cloud broker URL                      |
-| `CLAUDE_ROOM_ID`     | —                                                    | Auto-join this room on startup (invite code format: `room_id:secret_key`) |
-| `OPENAI_API_KEY`     | —                                                    | Enables auto-summary via gpt-5.4-nano |
+This fork diverges significantly from the original [claude-peers](https://github.com/louisarge/claude-peers) by Louis Arge:
+
+| Area | Upstream | This fork |
+|------|----------|-----------|
+| **Architecture** | Direct peer connections | Cloud broker via Cloudflare Workers + Durable Objects |
+| **Encryption** | None | Full E2E encryption (NaCl secretbox / XSalsa20-Poly1305) |
+| **Message delivery** | Polling | Instant push via WebSocket + Claude Code channel protocol |
+| **Peer identity** | Manual | Auto-detected from working directory + git branch |
+| **Room lifecycle** | Persistent | Ephemeral (auto-cleanup when empty, abandoned room alarm) |
+| **Join validation** | Open | Key-hash validated — broker verifies peers hold the correct secret |
+| **Security** | Basic | Timing-safe auth, pre-upgrade WS validation, encrypted metadata, input limits, CSPRNG |
+| **Summary** | N/A | Peers set their own summary via `set_summary` tool |
+| **History** | N/A | Last 50 messages retained, retrievable on demand |
+| **Plugin** | N/A | Published to Claude Code plugin marketplace with skills |
 
 ## Requirements
 
-- [Bun](https://bun.sh)
-- Claude Code v2.1.80+
+- [Bun](https://bun.sh) runtime
+- Claude Code v2.1.80+ (channel protocol support)
 - claude.ai login (channels require it — API key auth won't work)
