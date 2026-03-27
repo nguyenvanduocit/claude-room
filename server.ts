@@ -30,6 +30,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { encrypt, decrypt, generateSecretKey, parseInviteCode } from "./shared/crypto.ts";
 
 // --- Configuration ---
 
@@ -75,6 +76,7 @@ let connectedPeers: Map<string, CloudPeerInfo> = new Map();
 let messageHistory: CloudHistoryMessage[] = [];
 let reconnectDelay = 1000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let secretKey: string = ""; // E2E encryption key for current room
 
 // --- WebSocket connection manager ---
 
@@ -148,16 +150,36 @@ function handleServerMessage(msg: CloudServerMessage) {
       for (const peer of msg.peers) {
         connectedPeers.set(peer.id, peer);
       }
-      messageHistory = [...msg.history];
+      // Decrypt history messages if we have a secret key
+      messageHistory = msg.history.map((m) => {
+        if (secretKey) {
+          try {
+            return { ...m, text: decrypt(m.text, secretKey) };
+          } catch {
+            return { ...m, text: "[encrypted message — wrong key]" };
+          }
+        }
+        return m;
+      });
       log(`Registered as peer ${myId} with ${msg.peers.length} peer(s) and ${msg.history.length} history message(s)`);
       break;
     }
 
     case "message": {
+      // Decrypt message text if we have a secret key
+      let decryptedText = msg.text;
+      if (secretKey) {
+        try {
+          decryptedText = decrypt(msg.text, secretKey);
+        } catch {
+          decryptedText = "[encrypted message — wrong key]";
+        }
+      }
+
       const historyEntry: CloudHistoryMessage = {
         from_id: msg.from_id,
         from_name: msg.from_name,
-        text: msg.text,
+        text: decryptedText,
         sent_at: msg.sent_at,
         ...(msg.to_id ? { to_id: msg.to_id } : {}),
       };
@@ -168,7 +190,7 @@ function handleServerMessage(msg: CloudServerMessage) {
       mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: msg.text,
+          content: decryptedText,
           meta: {
             from_id: msg.from_id,
             from_name: msg.from_name,
@@ -179,7 +201,7 @@ function handleServerMessage(msg: CloudServerMessage) {
         },
       }).catch((e) => log(`Channel notification error: ${e}`));
 
-      log(`Message from ${msg.from_name} (${msg.from_id}): ${msg.text.slice(0, 80)}`);
+      log(`Message from ${msg.from_name} (${msg.from_id}): ${decryptedText.slice(0, 80)}`);
       break;
     }
 
@@ -237,15 +259,15 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. You can create or join rooms to collaborate with other Claude Code instances across machines.
+    instructions: `You are connected to the claude-peers network. You can create or join rooms to collaborate with other Claude Code instances across machines. All messages are E2E encrypted — the cloud broker only sees ciphertext.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_name, and from_summary attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- create_room: Create a new room and auto-join it
-- join_room: Join an existing room by room_id
+- create_room: Create a new room and auto-join it. Returns an invite code with encryption key.
+- join_room: Join an existing room by invite code (room_id:secret_key)
 - leave_room: Disconnect from the current room
 - list_peers: List other Claude Code instances in the current room
 - send_message: Send a message to a specific peer or broadcast to all
@@ -262,7 +284,7 @@ const TOOLS = [
   {
     name: "create_room",
     description:
-      "Create a new room on the cloud broker and auto-join it. Returns the room_id that others can use to join.",
+      "Create a new room on the cloud broker and auto-join it. Returns an invite code (room_id:secret_key) with E2E encryption key that others can use to join.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -277,16 +299,16 @@ const TOOLS = [
   {
     name: "join_room",
     description:
-      "Join an existing room by its room_id. Connects via WebSocket for real-time messaging.",
+      "Join an existing room by its invite code (room_id:secret_key). The secret key enables E2E encryption. Connects via WebSocket for real-time messaging.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        room_id: {
+        invite_code: {
           type: "string" as const,
-          description: "The room ID to join",
+          description: "The invite code to join (format: room_id:secret_key). A plain room_id also works but without encryption.",
         },
       },
-      required: ["room_id"],
+      required: ["invite_code"],
     },
   },
   {
@@ -378,6 +400,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         const data = await res.json() as { room_id: string; ws_url: string; name: string };
+
+        // Generate E2E encryption key
+        secretKey = generateSecretKey();
+        const inviteCode = `${data.room_id}:${secretKey}`;
+
         connectToRoom(data.room_id);
 
         // Wait briefly for registration to complete
@@ -386,7 +413,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return {
           content: [{
             type: "text" as const,
-            text: `Room created and joined!\nRoom ID: ${data.room_id}\nName: ${data.name}\nShare this room_id with other Claude Code instances so they can join.`,
+            text: `Room created and joined with E2E encryption!\nInvite code: ${inviteCode}\nName: ${data.name}\nShare this invite code with other Claude Code instances so they can join. The invite code includes the encryption key — the broker never sees it.`,
           }],
         };
       } catch (e) {
@@ -398,20 +425,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "join_room": {
-      const { room_id: targetRoom } = args as { room_id: string };
+      const { invite_code } = args as { invite_code: string };
+      const parsed = parseInviteCode(invite_code);
+      secretKey = parsed.secretKey;
+      const targetRoom = parsed.roomId;
       try {
         connectToRoom(targetRoom);
 
         // Wait briefly for registration to complete
         await new Promise((r) => setTimeout(r, 1000));
 
+        const encStatus = secretKey ? " (E2E encrypted)" : " (unencrypted)";
         if (myId) {
           return {
-            content: [{ type: "text" as const, text: `Joined room ${targetRoom} as peer ${myId}` }],
+            content: [{ type: "text" as const, text: `Joined room ${targetRoom} as peer ${myId}${encStatus}` }],
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}... (WebSocket may still be establishing)` }],
+          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}...${encStatus} (WebSocket may still be establishing)` }],
         };
       } catch (e) {
         return {
@@ -438,6 +469,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         ws = null;
       }
       myId = null;
+      secretKey = "";
       connectedPeers.clear();
       messageHistory = [];
       return {
@@ -488,9 +520,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
+      const sendText = secretKey ? encrypt(message, secretKey) : message;
       const sendMsg: CloudClientMessage = {
         type: "message",
-        text: message,
+        text: sendText,
         ...(to_id ? { to_id } : {}),
       };
       ws.send(JSON.stringify(sendMsg));
@@ -597,8 +630,10 @@ async function main() {
 
   // 4. Auto-join room if configured
   if (AUTO_JOIN_ROOM) {
-    log(`Auto-joining room: ${AUTO_JOIN_ROOM}`);
-    connectToRoom(AUTO_JOIN_ROOM);
+    const parsed = parseInviteCode(AUTO_JOIN_ROOM);
+    secretKey = parsed.secretKey;
+    log(`Auto-joining room: ${parsed.roomId}${parsed.secretKey ? " (E2E encrypted)" : ""}`);
+    connectToRoom(parsed.roomId);
   }
 
   // 5. Clean up on exit
