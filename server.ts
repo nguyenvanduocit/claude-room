@@ -138,6 +138,7 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let currentSummary = "";
 
 // --- MCP Server ---
 
@@ -340,6 +341,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        currentSummary = summary;
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -477,6 +479,7 @@ async function main() {
       });
       if (summary) {
         initialSummary = summary;
+        currentSummary = summary;
         log(`Auto-summary: ${summary}`);
       }
     } catch (e) {
@@ -519,13 +522,27 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat (with auto-reconnect if broker restarted)
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
+    if (!myId) return;
+    try {
+      await brokerFetch("/heartbeat", { id: myId });
+    } catch {
+      // Broker may have restarted — try to re-register
+      log("Heartbeat failed, attempting re-register...");
       try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+        await ensureBroker();
+        const reg = await brokerFetch<RegisterResponse>("/register", {
+          pid: process.pid,
+          cwd: myCwd,
+          git_root: myGitRoot,
+          tty: getTty(),
+          summary: currentSummary,
+        });
+        myId = reg.id;
+        log(`Re-registered as peer ${myId}`);
+      } catch (e) {
+        log(`Re-register failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
