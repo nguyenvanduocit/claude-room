@@ -1,6 +1,7 @@
 import type { PeerInfo, HistoryMessage, ClientMessage, ServerMessage } from "./types";
 
 const MAX_HISTORY = 50;
+const ZOOKEEPER_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 /**
  * Metadata attached to each WebSocket via serializeAttachment/deserializeAttachment.
@@ -104,6 +105,18 @@ export class Room implements DurableObject {
     }
   }
 
+  /** Zookeeper alarm — clean up abandoned rooms */
+  async alarm(): Promise<void> {
+    const activePeers = this.getActivePeers();
+    if (activePeers.length === 0) {
+      await this.state.storage.deleteAll();
+      this.roomName = "";
+    } else {
+      // Peers still active — reschedule
+      await this.state.storage.setAlarm(Date.now() + ZOOKEEPER_INTERVAL_MS);
+    }
+  }
+
   webSocketClose(ws: WebSocket): void {
     this.removePeer(ws);
   }
@@ -192,6 +205,9 @@ export class Room implements DurableObject {
     });
 
     this.broadcast({ type: "peer_joined", peer: info }, peerId);
+
+    // Schedule zookeeper alarm (resets on each new peer)
+    await this.state.storage.setAlarm(Date.now() + ZOOKEEPER_INTERVAL_MS);
   }
 
   private async handleMessage(
