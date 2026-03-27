@@ -19,7 +19,14 @@ Let your Claude Code instances find each other and talk — across terminals, ma
 
 ```bash
 claude plugin marketplace add nguyenvanduocit/claude-room
-claude plugin install claude-room
+claude plugin install claude-room --scope user
+```
+
+### Update to latest version
+
+```bash
+claude plugin marketplace update claude-room
+claude plugin install claude-room --scope user
 ```
 
 ### 2. Enable channel mode (for instant message push)
