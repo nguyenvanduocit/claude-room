@@ -10,26 +10,30 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
-- `shared/types.ts` — Shared TypeScript types for broker API.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to cloud broker via WebSocket, exposes tools, pushes channel notifications.
+- `shared/types.ts` — Shared TypeScript types for broker API and cloud protocol.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
-- `cli.ts` — CLI utility for inspecting broker state.
+- `broker.ts` — Legacy localhost broker (kept for local-only usage).
+- `cli.ts` — CLI utility for inspecting local broker state.
+- Cloud broker: Cloudflare Worker + Durable Objects at `claude-room.nguyenvanduocit.workers.dev` (source: `/Volumes/Data/tmp/claude-room-server/`)
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_ROOM_URL` | `https://claude-room.nguyenvanduocit.workers.dev` | Cloud broker URL |
+| `CLAUDE_ROOM_ID` | — | Auto-join this room on startup |
+| `OPENAI_API_KEY` | — | Enables auto-summary via gpt-5.4-nano |
 
 ## Running
 
 ```bash
-# Start Claude Code with the channel:
+# Install as plugin:
+claude plugin marketplace add nguyenvanduocit/claude-room
+claude plugin install claude-peers
+
+# Or start with channel mode:
 claude --dangerously-load-development-channels server:claude-peers
-
-# Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
-# { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
-
-# CLI:
-bun cli.ts status
-bun cli.ts peers
-bun cli.ts send <peer-id> <message>
-bun cli.ts kill-broker
 ```
 
 ## Bun

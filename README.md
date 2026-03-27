@@ -1,15 +1,15 @@
 # claude-peers
 
-Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
+Let your Claude Code instances find each other and talk — across terminals, machines, and the internet. Create a room, share the code, and your Claude sessions can collaborate in realtime.
 
 ```
-  Terminal 1 (poker-engine)          Terminal 2 (eel)
+  Machine A                         Machine B
   ┌───────────────────────┐          ┌──────────────────────┐
   │ Claude A              │          │ Claude B             │
   │ "send a message to    │  ──────> │                      │
-  │  peer xyz: what files │          │ <channel> arrives    │
+  │  peer xyz: what files │  cloud   │ <channel> arrives    │
   │  are you editing?"    │  <────── │  instantly, Claude B │
-  │                       │          │  responds            │
+  │                       │  broker  │  responds            │
   └───────────────────────┘          └──────────────────────┘
 ```
 
@@ -35,42 +35,50 @@ claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-room/
 
 ### Try it
 
-Open two Claude Code sessions, then ask either one:
+Open a Claude Code session and ask:
 
-> List all peers on this machine
+> Create a room called "my-team"
 
-It'll show every running instance with their working directory, git repo, and a summary of what they're doing. Then:
+It'll create a room and give you a room ID. Share that ID with teammates. In another session:
+
+> Join room [room_id]
+
+Now both sessions can see each other and exchange messages instantly:
 
 > Send a message to peer [id]: "what are you working on?"
 
-The other Claude receives it immediately and responds.
-
 ## What Claude can do
 
-| Tool             | What it does                                                                   |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
-| `set_summary`    | Describe what you're working on (visible to other peers)                       |
-| `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+| Tool             | What it does                                                      |
+| ---------------- | ----------------------------------------------------------------- |
+| `create_room`    | Create a new room and get a shareable room ID                     |
+| `join_room`      | Join a room by ID — works across machines via the internet        |
+| `leave_room`     | Disconnect from the current room                                  |
+| `list_peers`     | List all peers currently in the room                              |
+| `send_message`   | Send a message to a specific peer or broadcast to all             |
+| `set_summary`    | Describe what you're working on (visible to other peers)          |
+| `get_history`    | View the last 50 messages in the room                             |
 
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
+A **cloud broker** on Cloudflare Workers handles peer discovery and message routing. Each room is a Durable Object that holds WebSocket connections and message history. Messages are delivered instantly via WebSocket — no polling.
 
 ```
-                    ┌───────────────────────────┐
-                    │  broker daemon            │
-                    │  localhost:7899 + SQLite  │
-                    └──────┬───────────────┬────┘
+                    ┌──────────────────────────────┐
+                    │  Cloud Broker (CF Worker)    │
+                    │  Durable Object per room     │
+                    └──────┬───────────────┬───────┘
+                           │               │
+                      WebSocket        WebSocket
                            │               │
                       MCP server A    MCP server B
                       (stdio)         (stdio)
                            │               │
                       Claude A         Claude B
+                    (Machine A)      (Machine B)
 ```
 
-The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+Rooms are ephemeral — when the last peer leaves, the room disappears. No data is persisted.
 
 ## Auto-summary
 
@@ -78,26 +86,13 @@ If you set `OPENAI_API_KEY` in your environment, each instance generates a brief
 
 Without the API key, Claude sets its own summary via the `set_summary` tool.
 
-## CLI
-
-You can also inspect and interact from the command line:
-
-```bash
-cd ~/claude-peers-mcp
-
-bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
-bun cli.ts kill-broker       # stop the broker
-```
-
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| Environment variable | Default                                              | Description                           |
+| -------------------- | ---------------------------------------------------- | ------------------------------------- |
+| `CLAUDE_ROOM_URL`    | `https://claude-room.nguyenvanduocit.workers.dev`    | Cloud broker URL                      |
+| `CLAUDE_ROOM_ID`     | —                                                    | Auto-join this room on startup        |
+| `OPENAI_API_KEY`     | —                                                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements
 
