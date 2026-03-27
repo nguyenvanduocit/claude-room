@@ -73,7 +73,6 @@ let myDisplayName = "";
 let ws: WebSocket | null = null;
 let roomId: string | null = null;
 let connectedPeers: Map<string, CloudPeerInfo> = new Map();
-let messageHistory: CloudHistoryMessage[] = [];
 let reconnectDelay = 1000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -166,18 +165,7 @@ function handleServerMessage(msg: CloudServerMessage) {
       for (const peer of msg.peers) {
         connectedPeers.set(peer.id, peer);
       }
-      // Decrypt history messages if we have a secret key
-      messageHistory = msg.history.map((m) => {
-        if (secretKey) {
-          try {
-            return { ...m, text: decrypt(m.text, secretKey) };
-          } catch {
-            return { ...m, text: "[encrypted message — wrong key]" };
-          }
-        }
-        return m;
-      });
-      log(`Registered as peer ${myId} with ${msg.peers.length} peer(s) and ${msg.history.length} history message(s)`);
+      log(`Registered as peer ${myId} with ${msg.peers.length} peer(s)`);
       break;
     }
 
@@ -191,15 +179,6 @@ function handleServerMessage(msg: CloudServerMessage) {
           decryptedText = "[encrypted message — wrong key]";
         }
       }
-
-      const historyEntry: CloudHistoryMessage = {
-        from_id: msg.from_id,
-        from_name: msg.from_name,
-        text: decryptedText,
-        sent_at: msg.sent_at,
-        ...(msg.to_id ? { to_id: msg.to_id } : {}),
-      };
-      messageHistory.push(historyEntry);
 
       // Skip channel notification for own messages (broker echoes them back)
       if (msg.from_id === myId) {
@@ -477,7 +456,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       myId = null;
       secretKey = "";
       connectedPeers.clear();
-      messageHistory = [];
       return {
         content: [{ type: "text" as const, text: `Left room ${leftRoom}` }],
       };
@@ -564,22 +542,50 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      if (messageHistory.length === 0) {
+      try {
+        const res = await fetch(`${CLOUD_BROKER_URL}/rooms/${roomId}/history`);
+        if (!res.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to fetch history: ${res.status}` }],
+            isError: true,
+          };
+        }
+        const data = await res.json() as { history: CloudHistoryMessage[] };
+
+        if (data.history.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No message history." }],
+          };
+        }
+
+        // Decrypt messages client-side
+        const decrypted = data.history.map((m) => {
+          if (secretKey) {
+            try {
+              return { ...m, text: decrypt(m.text, secretKey) };
+            } catch {
+              return { ...m, text: "[encrypted message — wrong key]" };
+            }
+          }
+          return m;
+        });
+
+        const lines = decrypted.map(
+          (m) => `[${m.sent_at}] ${m.from_name} (${m.from_id})${m.to_id ? ` -> ${m.to_id}` : ""}:\n${m.text}`
+        );
+
         return {
-          content: [{ type: "text" as const, text: "No message history." }],
+          content: [{
+            type: "text" as const,
+            text: `${decrypted.length} message(s) in history:\n\n${lines.join("\n\n---\n\n")}`,
+          }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error fetching history: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
         };
       }
-
-      const lines = messageHistory.map(
-        (m) => `[${m.sent_at}] ${m.from_name} (${m.from_id})${m.to_id ? ` -> ${m.to_id}` : ""}:\n${m.text}`
-      );
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `${messageHistory.length} message(s) in history:\n\n${lines.join("\n\n---\n\n")}`,
-        }],
-      };
     }
 
     default:

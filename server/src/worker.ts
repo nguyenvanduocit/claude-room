@@ -70,6 +70,17 @@ export default {
       }));
     }
 
+    // GET /rooms/:room_id/history — message history
+    const historyMatch = url.pathname.match(/^\/rooms\/([a-z0-9]+)\/history$/);
+    if (historyMatch) {
+      const roomId = historyMatch[1];
+      const doId = env.ROOM.idFromName(roomId);
+      const stub = env.ROOM.get(doId);
+      const res = await stub.fetch(new Request("http://room/history"));
+      const data = await res.json();
+      return Response.json(data, { headers: corsHeaders() });
+    }
+
     // GET /rooms/:room_id — room info
     const infoMatch = url.pathname.match(/^\/rooms\/([a-z0-9]+)$/);
     if (infoMatch) {

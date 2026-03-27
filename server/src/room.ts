@@ -43,6 +43,12 @@ export class Room implements DurableObject {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    // GET /history — message history
+    if (url.pathname === "/history") {
+      const history = (await this.state.storage.get<HistoryMessage[]>("history")) ?? [];
+      return Response.json({ history });
+    }
+
     // GET /info — room info
     if (url.pathname === "/info") {
       if (!this.roomName) {
