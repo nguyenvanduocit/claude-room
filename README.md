@@ -15,16 +15,45 @@ Let your Claude Code instances find each other and talk — across terminals, ma
 
 ## Quick start
 
-### Option A: Install as plugin (recommended)
+### 1. Install
 
 ```bash
 claude plugin marketplace add nguyenvanduocit/claude-room
 claude plugin install claude-peers
 ```
 
-That's it. The MCP server and skills are automatically available in every Claude Code session.
+### 2. Enable channel mode (for instant message push)
 
-### Option B: Manual install
+```bash
+claude --dangerously-load-development-channels plugin:claude-peers@claude-room
+```
+
+Without channel mode, tools still work but inbound messages won't push automatically — you'd need to call `get_history` manually.
+
+### 3. Create and join a room
+
+In one Claude Code session:
+
+> Create a room called "my-team"
+
+Share the room ID with your teammates. In another session (same machine or different machine):
+
+> Join room abc12345
+
+Now both sessions can see each other and exchange messages instantly:
+
+> Send a message to peer [id]: "what are you working on?"
+
+### Auto-join on startup
+
+Set `CLAUDE_ROOM_ID` to automatically join a room when Claude Code starts:
+
+```bash
+export CLAUDE_ROOM_ID=abc12345
+claude --dangerously-load-development-channels plugin:claude-peers@claude-room
+```
+
+### Manual install (without plugin)
 
 ```bash
 git clone https://github.com/nguyenvanduocit/claude-room.git ~/claude-room
@@ -32,20 +61,6 @@ cd ~/claude-room
 bun install
 claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-room/server.ts
 ```
-
-### Try it
-
-Open a Claude Code session and ask:
-
-> Create a room called "my-team"
-
-It'll create a room and give you a room ID. Share that ID with teammates. In another session:
-
-> Join room [room_id]
-
-Now both sessions can see each other and exchange messages instantly:
-
-> Send a message to peer [id]: "what are you working on?"
 
 ## What Claude can do
 
@@ -79,6 +94,15 @@ A **cloud broker** on Cloudflare Workers handles peer discovery and message rout
 ```
 
 Rooms are ephemeral — when the last peer leaves, the room disappears. No data is persisted.
+
+Each MCP server maintains a WebSocket connection to the cloud broker internally. When messages arrive, they are pushed into Claude Code via the [channel protocol](https://code.claude.com/docs/en/channels-reference), so Claude sees them immediately without polling.
+
+## Rooms
+
+- **Ephemeral**: Rooms exist only while at least one peer is connected. When everyone leaves, the room is gone.
+- **No auth**: Anyone with the room ID can join. Room IDs are 8-char random alphanumeric — not guessable, but treat them like a shared secret.
+- **History**: The room keeps the last 50 messages. When a new peer joins, they receive the full history so they have context.
+- **Multi-session**: One person running 5 terminals = 5 peers in the room. Each session has its own identity (auto-detected from project directory + git branch).
 
 ## Auto-summary
 
