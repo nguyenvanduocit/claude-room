@@ -353,7 +353,7 @@ export class Room implements DurableObject {
 
   // --- Helpers ---
 
-  private removePeer(ws: WebSocket): void {
+  private async removePeer(ws: WebSocket): Promise<void> {
     const att = ws.deserializeAttachment() as WsAttachment | null;
     if (!att?.peerId) return;
 
@@ -373,6 +373,13 @@ export class Room implements DurableObject {
       ws.close(1000, "Peer left");
     } catch {
       // Already closed
+    }
+
+    // If no active peers remain, wipe all storage (room ceases to exist)
+    const remaining = this.getActivePeers().filter((p) => p.attachment.peerId !== att.peerId);
+    if (remaining.length === 0) {
+      await this.state.storage.deleteAll();
+      this.roomName = "";
     }
   }
 
