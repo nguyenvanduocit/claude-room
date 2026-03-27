@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
 /**
- * claude-peers MCP server (cloud broker edition)
+ * claude-room MCP server (cloud broker edition)
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to a cloud broker via WebSocket for peer discovery and messaging.
  * Declares claude/channel capability to push inbound messages immediately.
  *
  * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
+ *   claude --dangerously-load-development-channels server:claude-room
  *
  * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ *   { "claude-room": { "command": "bun", "args": ["./server.ts"] } }
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -41,7 +41,7 @@ const AUTO_JOIN_ROOM = process.env.CLAUDE_ROOM_ID ?? "";
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
-  console.error(`[claude-peers] ${msg}`);
+  console.error(`[claude-room] ${msg}`);
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
@@ -269,15 +269,15 @@ function handleServerMessage(msg: CloudServerMessage) {
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.2.0" },
+  { name: "claude-room", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. You can create or join rooms to collaborate with other Claude Code instances across machines. All messages are E2E encrypted — the cloud broker only sees ciphertext.
+    instructions: `You are connected to the claude-room network. You can create or join rooms to collaborate with other Claude Code instances across machines. All messages are E2E encrypted — the cloud broker only sees ciphertext.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-room" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_name, and from_summary attributes to understand who sent the message. Reply by calling send_message with their from_id.
 

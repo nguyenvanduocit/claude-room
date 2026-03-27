@@ -4,18 +4,17 @@ globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
 alwaysApply: false
 ---
 
-# claude-peers
+# claude-room
 
 Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to cloud broker via WebSocket, exposes tools, pushes channel notifications.
-- `shared/types.ts` — Shared TypeScript types for broker API and cloud protocol.
+- `shared/types.ts` — Shared TypeScript types for cloud broker protocol.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
-- `broker.ts` — Legacy localhost broker (kept for local-only usage).
-- `cli.ts` — CLI utility for inspecting local broker state.
-- Cloud broker: Cloudflare Worker + Durable Objects at `claude-room.nguyenvanduocit.workers.dev` (source: `/Volumes/Data/tmp/claude-room-server/`)
+- `shared/crypto.ts` — E2E encryption (NaCl secretbox) and invite code parsing.
+- `server/` — Cloud broker (Cloudflare Worker + Durable Objects), deployed at `claude-room.nguyenvanduocit.workers.dev`. Run `cd server && wrangler dev` for local dev, `wrangler deploy` to publish.
 
 ## Environment Variables
 
@@ -30,10 +29,10 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 ```bash
 # Install as plugin:
 claude plugin marketplace add nguyenvanduocit/claude-room
-claude plugin install claude-peers
+claude plugin install claude-room
 
 # Or start with channel mode:
-claude --dangerously-load-development-channels server:claude-peers
+claude --dangerously-load-development-channels server:claude-room
 ```
 
 ## Bun
