@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * claude-peers MCP server
+ * claude-peers MCP server (cloud broker edition)
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
- * Connects to the shared broker daemon for peer discovery and messaging.
+ * Connects to a cloud broker via WebSocket for peer discovery and messaging.
  * Declares claude/channel capability to push inbound messages immediately.
  *
  * Usage:
@@ -20,11 +20,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
-  PeerId,
-  Peer,
-  RegisterResponse,
-  PollMessagesResponse,
-  Message,
+  CloudPeerInfo,
+  CloudHistoryMessage,
+  CloudClientMessage,
+  CloudServerMessage,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -34,62 +33,8 @@ import {
 
 // --- Configuration ---
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-const POLL_INTERVAL_MS = 1000;
-const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
-
-// --- Broker communication ---
-
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BROKER_URL}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
-  }
-  return res.json() as Promise<T>;
-}
-
-async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function ensureBroker(): Promise<void> {
-  if (await isBrokerAlive()) {
-    log("Broker already running");
-    return;
-  }
-
-  log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
-  });
-
-  // Unref so this process can exit without waiting for the broker
-  proc.unref();
-
-  // Wait for it to come up
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
-    if (await isBrokerAlive()) {
-      log("Broker started");
-      return;
-    }
-  }
-  throw new Error("Failed to start broker daemon after 6 seconds");
-}
+const CLOUD_BROKER_URL = process.env.CLAUDE_ROOM_URL ?? "https://claude-room.nguyenvanduocit.workers.dev";
+const AUTO_JOIN_ROOM = process.env.CLAUDE_ROOM_ID ?? "";
 
 // --- Utility ---
 
@@ -116,50 +61,196 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   return null;
 }
 
-function getTty(): string | null {
-  try {
-    // Try to get the parent's tty from the process tree
-    const ppid = process.ppid;
-    if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
-      if (tty && tty !== "?" && tty !== "??") {
-        return tty;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
 // --- State ---
 
-let myId: PeerId | null = null;
+let myId: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let currentSummary = "";
+let myDisplayName = "";
+
+let ws: WebSocket | null = null;
+let roomId: string | null = null;
+let connectedPeers: Map<string, CloudPeerInfo> = new Map();
+let messageHistory: CloudHistoryMessage[] = [];
+let reconnectDelay = 1000;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+// --- WebSocket connection manager ---
+
+function connectToRoom(targetRoomId: string) {
+  // Close existing connection if any
+  if (ws) {
+    try { ws.close(); } catch {}
+    ws = null;
+  }
+
+  roomId = targetRoomId;
+  reconnectDelay = 1000;
+
+  const wsUrl = `${CLOUD_BROKER_URL.replace("https", "wss").replace("http", "ws")}/rooms/${targetRoomId}/ws`;
+  log(`Connecting to room ${targetRoomId} at ${wsUrl}`);
+
+  const socket = new WebSocket(wsUrl);
+
+  socket.onopen = () => {
+    log(`WebSocket connected to room ${targetRoomId}`);
+    reconnectDelay = 1000; // reset backoff on successful connect
+
+    const registerMsg: CloudClientMessage = {
+      type: "register",
+      display_name: myDisplayName,
+      summary: currentSummary,
+      project_hint: myGitRoot ?? myCwd,
+    };
+    socket.send(JSON.stringify(registerMsg));
+  };
+
+  socket.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(String(event.data)) as CloudServerMessage;
+      handleServerMessage(msg);
+    } catch (e) {
+      log(`Failed to parse WebSocket message: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  socket.onclose = () => {
+    log("WebSocket closed");
+    ws = null;
+
+    // Auto-reconnect with exponential backoff if we still want to be in this room
+    if (roomId) {
+      const delay = Math.min(reconnectDelay, 30000);
+      log(`Reconnecting in ${delay}ms...`);
+      reconnectTimer = setTimeout(() => {
+        if (roomId) {
+          reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+          connectToRoom(roomId);
+        }
+      }, delay);
+    }
+  };
+
+  socket.onerror = (err) => {
+    log(`WebSocket error: ${err}`);
+    // onclose will fire after this
+  };
+
+  ws = socket;
+}
+
+function handleServerMessage(msg: CloudServerMessage) {
+  switch (msg.type) {
+    case "registered": {
+      myId = msg.peer_id;
+      connectedPeers.clear();
+      for (const peer of msg.peers) {
+        connectedPeers.set(peer.id, peer);
+      }
+      messageHistory = [...msg.history];
+      log(`Registered as peer ${myId} with ${msg.peers.length} peer(s) and ${msg.history.length} history message(s)`);
+      break;
+    }
+
+    case "message": {
+      const historyEntry: CloudHistoryMessage = {
+        from_id: msg.from_id,
+        from_name: msg.from_name,
+        text: msg.text,
+        sent_at: msg.sent_at,
+        ...(msg.to_id ? { to_id: msg.to_id } : {}),
+      };
+      messageHistory.push(historyEntry);
+
+      // Push as channel notification
+      const sender = connectedPeers.get(msg.from_id);
+      mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: msg.text,
+          meta: {
+            from_id: msg.from_id,
+            from_name: msg.from_name,
+            from_summary: sender?.summary ?? "",
+            from_project: sender?.project_hint ?? "",
+            sent_at: msg.sent_at,
+          },
+        },
+      }).catch((e) => log(`Channel notification error: ${e}`));
+
+      log(`Message from ${msg.from_name} (${msg.from_id}): ${msg.text.slice(0, 80)}`);
+      break;
+    }
+
+    case "peer_joined": {
+      connectedPeers.set(msg.peer.id, msg.peer);
+
+      mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `Peer joined: ${msg.peer.display_name} (${msg.peer.id}) — ${msg.peer.summary || "no summary"}`,
+          meta: {
+            event: "peer_joined",
+            peer_id: msg.peer.id,
+            peer_name: msg.peer.display_name,
+          },
+        },
+      }).catch((e) => log(`Channel notification error: ${e}`));
+
+      log(`Peer joined: ${msg.peer.display_name} (${msg.peer.id})`);
+      break;
+    }
+
+    case "peer_left": {
+      connectedPeers.delete(msg.peer_id);
+
+      mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `Peer left: ${msg.display_name} (${msg.peer_id})`,
+          meta: {
+            event: "peer_left",
+            peer_id: msg.peer_id,
+            peer_name: msg.display_name,
+          },
+        },
+      }).catch((e) => log(`Channel notification error: ${e}`));
+
+      log(`Peer left: ${msg.display_name} (${msg.peer_id})`);
+      break;
+    }
+
+    case "error": {
+      log(`Server error: ${msg.message}`);
+      break;
+    }
+  }
+}
 
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: "0.2.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. You can create or join rooms to collaborate with other Claude Code instances across machines.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+Read the from_id, from_name, and from_summary attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
+- create_room: Create a new room and auto-join it
+- join_room: Join an existing room by room_id
+- leave_room: Disconnect from the current room
+- list_peers: List other Claude Code instances in the current room
+- send_message: Send a message to a specific peer or broadcast to all
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
+- get_history: Get message history for the current room
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -169,45 +260,76 @@ When you start, proactively call set_summary to describe what you're working on.
 
 const TOOLS = [
   {
-    name: "list_peers",
+    name: "create_room",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "Create a new room on the cloud broker and auto-join it. Returns the room_id that others can use to join.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        scope: {
+        name: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo"],
-          description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+          description: "A human-readable name for the room",
         },
       },
-      required: ["scope"],
+      required: ["name"],
+    },
+  },
+  {
+    name: "join_room",
+    description:
+      "Join an existing room by its room_id. Connects via WebSocket for real-time messaging.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: {
+          type: "string" as const,
+          description: "The room ID to join",
+        },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "leave_room",
+    description:
+      "Leave the current room, disconnecting from WebSocket.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "list_peers",
+    description:
+      "List other Claude Code instances connected to the current room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
     },
   },
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to a specific peer by ID, or broadcast to all peers in the room if no to_id is provided.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description: "The peer ID to send to (omit to broadcast to all peers)",
         },
         message: {
           type: "string" as const,
           description: "The message to send",
         },
       },
-      required: ["to_id", "message"],
+      required: ["message"],
     },
   },
   {
     name: "set_summary",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
+      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other peers in the room.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -220,9 +342,9 @@ const TOOLS = [
     },
   },
   {
-    name: "check_messages",
+    name: "get_history",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Get the message history for the current room.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -240,160 +362,185 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
   switch (name) {
-    case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+    case "create_room": {
+      const { name: roomName } = args as { name: string };
       try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope,
-          cwd: myCwd,
-          git_root: myGitRoot,
-          exclude_id: myId,
+        const res = await fetch(`${CLOUD_BROKER_URL}/rooms`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: roomName }),
         });
-
-        if (peers.length === 0) {
+        if (!res.ok) {
+          const err = await res.text();
           return {
-            content: [
-              {
-                type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
-              },
-            ],
+            content: [{ type: "text" as const, text: `Failed to create room: ${res.status} ${err}` }],
+            isError: true,
           };
         }
+        const data = await res.json() as { room_id: string; ws_url: string; name: string };
+        connectToRoom(data.room_id);
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
-        });
+        // Wait briefly for registration to complete
+        await new Promise((r) => setTimeout(r, 1000));
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
-            },
-          ],
+          content: [{
+            type: "text" as const,
+            text: `Room created and joined!\nRoom ID: ${data.room_id}\nName: ${data.name}\nShare this room_id with other Claude Code instances so they can join.`,
+          }],
         };
       } catch (e) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error listing peers: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: `Error creating room: ${e instanceof Error ? e.message : String(e)}` }],
           isError: true,
         };
       }
     }
 
-    case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
+    case "join_room": {
+      const { room_id: targetRoom } = args as { room_id: string };
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-          from_id: myId,
-          to_id,
-          text: message,
-        });
-        if (!result.ok) {
+        connectToRoom(targetRoom);
+
+        // Wait briefly for registration to complete
+        await new Promise((r) => setTimeout(r, 1000));
+
+        if (myId) {
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
-            isError: true,
+            content: [{ type: "text" as const, text: `Joined room ${targetRoom} as peer ${myId}` }],
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}... (WebSocket may still be establishing)` }],
         };
       } catch (e) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: `Error joining room: ${e instanceof Error ? e.message : String(e)}` }],
           isError: true,
         };
       }
+    }
+
+    case "leave_room": {
+      if (!roomId) {
+        return {
+          content: [{ type: "text" as const, text: "Not currently in a room." }],
+        };
+      }
+      const leftRoom = roomId;
+      roomId = null;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      myId = null;
+      connectedPeers.clear();
+      messageHistory = [];
+      return {
+        content: [{ type: "text" as const, text: `Left room ${leftRoom}` }],
+      };
+    }
+
+    case "list_peers": {
+      if (!roomId) {
+        return {
+          content: [{ type: "text" as const, text: "Not in a room. Use create_room or join_room first." }],
+          isError: true,
+        };
+      }
+
+      const peers = Array.from(connectedPeers.values()).filter((p) => p.id !== myId);
+      if (peers.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `No other peers in room ${roomId}.` }],
+        };
+      }
+
+      const lines = peers.map((p) => {
+        const parts = [
+          `ID: ${p.id}`,
+          `Name: ${p.display_name}`,
+        ];
+        if (p.project_hint) parts.push(`Project: ${p.project_hint}`);
+        if (p.summary) parts.push(`Summary: ${p.summary}`);
+        parts.push(`Connected: ${p.connected_at}`);
+        return parts.join("\n  ");
+      });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Found ${peers.length} peer(s) in room ${roomId}:\n\n${lines.join("\n\n")}`,
+        }],
+      };
+    }
+
+    case "send_message": {
+      const { to_id, message } = args as { to_id?: string; message: string };
+      if (!roomId || !ws || ws.readyState !== WebSocket.OPEN) {
+        return {
+          content: [{ type: "text" as const, text: "Not connected to a room. Use create_room or join_room first." }],
+          isError: true,
+        };
+      }
+
+      const sendMsg: CloudClientMessage = {
+        type: "message",
+        text: message,
+        ...(to_id ? { to_id } : {}),
+      };
+      ws.send(JSON.stringify(sendMsg));
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: to_id ? `Message sent to peer ${to_id}` : `Message broadcast to all peers in room`,
+        }],
+      };
     }
 
     case "set_summary": {
       const { summary } = args as { summary: string };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+      currentSummary = summary;
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const msg: CloudClientMessage = { type: "set_summary", summary };
+        ws.send(JSON.stringify(msg));
       }
-      try {
-        await brokerFetch("/set-summary", { id: myId, summary });
-        currentSummary = summary;
-        return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
+
+      return {
+        content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
+      };
     }
 
-    case "check_messages": {
-      if (!myId) {
+    case "get_history": {
+      if (!roomId) {
         return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          content: [{ type: "text" as const, text: "Not in a room. Use create_room or join_room first." }],
           isError: true,
         };
       }
-      try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No new messages." }],
-          };
-        }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+
+      if (messageHistory.length === 0) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
+          content: [{ type: "text" as const, text: "No message history." }],
         };
       }
+
+      const lines = messageHistory.map(
+        (m) => `[${m.sent_at}] ${m.from_name} (${m.from_id})${m.to_id ? ` -> ${m.to_id}` : ""}:\n${m.text}`
+      );
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${messageHistory.length} message(s) in history:\n\n${lines.join("\n\n---\n\n")}`,
+        }],
+      };
     }
 
     default:
@@ -401,75 +548,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
-
-async function pollAndPushMessages() {
-  if (!myId) return;
-
-  try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
-
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
-      });
-
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
-    }
-  } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
-
 // --- Startup ---
 
 async function main() {
-  // 1. Ensure broker is running
-  await ensureBroker();
-
-  // 2. Gather context
+  // 1. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
-  const tty = getTty();
+  const branch = await getGitBranch(myCwd);
+
+  const cwdBasename = myCwd.split("/").pop() ?? myCwd;
+  myDisplayName = branch ? `${cwdBasename}@${branch}` : cwdBasename;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
+  log(`Display name: ${myDisplayName}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
+  // 2. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   const summaryPromise = (async () => {
     try {
-      const branch = await getGitBranch(myCwd);
       const recentFiles = await getRecentFiles(myCwd);
       const summary = await generateSummary({
         cwd: myCwd,
@@ -478,9 +574,14 @@ async function main() {
         recent_files: recentFiles,
       });
       if (summary) {
-        initialSummary = summary;
         currentSummary = summary;
         log(`Auto-summary: ${summary}`);
+
+        // If already connected, push the summary update
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          const msg: CloudClientMessage = { type: "set_summary", summary };
+          ws.send(JSON.stringify(msg));
+        }
       }
     } catch (e) {
       log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
@@ -490,75 +591,28 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
-
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
-  }
-
-  // 5. Connect MCP over stdio
+  // 3. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 4. Auto-join room if configured
+  if (AUTO_JOIN_ROOM) {
+    log(`Auto-joining room: ${AUTO_JOIN_ROOM}`);
+    connectToRoom(AUTO_JOIN_ROOM);
+  }
 
-  // 7. Start heartbeat (with auto-reconnect if broker restarted)
-  const heartbeatTimer = setInterval(async () => {
-    if (!myId) return;
-    try {
-      await brokerFetch("/heartbeat", { id: myId });
-    } catch {
-      // Broker may have restarted — try to re-register
-      log("Heartbeat failed, attempting re-register...");
-      try {
-        await ensureBroker();
-        const reg = await brokerFetch<RegisterResponse>("/register", {
-          pid: process.pid,
-          cwd: myCwd,
-          git_root: myGitRoot,
-          tty: getTty(),
-          summary: currentSummary,
-        });
-        myId = reg.id;
-        log(`Re-registered as peer ${myId}`);
-      } catch (e) {
-        log(`Re-register failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
+  // 5. Clean up on exit
+  const cleanup = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
-  }, HEARTBEAT_INTERVAL_MS);
-
-  // 8. Clean up on exit
-  const cleanup = async () => {
-    clearInterval(pollTimer);
-    clearInterval(heartbeatTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
-      } catch {
-        // Best effort
-      }
+    roomId = null; // prevent reconnect
+    if (ws) {
+      try { ws.close(); } catch {}
+      ws = null;
     }
+    log("Cleaned up");
     process.exit(0);
   };
 
