@@ -453,7 +453,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Connecting to room ${targetRoom}... (waiting for peer validation)` }],
+          content: [{ type: "text" as const, text: `Failed to connect to room ${targetRoom} — connection could not be established` }],
+          isError: true,
         };
       } catch (e) {
         return {

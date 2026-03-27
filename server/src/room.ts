@@ -31,8 +31,10 @@ export class Room implements DurableObject {
 
     // GET /ws — WebSocket upgrade
     if (url.pathname === "/ws") {
+      // Room must have been created (via /init or first-peer registration)
       const initialized = await this.state.storage.get<boolean>("initialized");
-      if (!initialized) {
+      const hasKey = await this.state.storage.get<string>("keyHash");
+      if (!initialized && !hasKey) {
         return Response.json({ error: "Room does not exist" }, { status: 404 });
       }
 
